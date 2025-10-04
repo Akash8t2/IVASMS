@@ -1,28 +1,46 @@
 {
-  "name": "iVasms Telegram Bot",
-  "description": "Fetch SMS from ivasms and forward to Telegram",
-  "repository": "https://github.com/yourusername/ivasms-bot",
-  "keywords": ["telegram", "bot", "heroku", "httpx", "ivasms"],
+  "name": "IVASMS OTP Forwarder",
+  "description": "Fetches OTPs from IVASMS and forwards to Telegram using MongoDB to prevent duplicates. Fully Heroku-ready and runs 24/7.",
+  "repository": "https://github.com/BrandedSupport/IVASMSForwarder",
+  "keywords": ["heroku", "telegram", "otp", "sms", "forwarder", "mongodb"],
   "env": {
-    "YOUR_BOT_TOKEN": {
-      "description": "Telegram Bot API Token from BotFather",
+    "BOT_TOKEN": {
+      "description": "Your Telegram Bot token",
       "required": true
     },
     "USERNAME": {
-      "description": "iVasms login email",
-      "required": true
+      "description": "IVASMS login username",
+      "required": true,
+      "value": ""
     },
     "PASSWORD": {
-      "description": "iVasms login password",
-      "required": true
+      "description": "IVASMS login password",
+      "required": true,
+      "value": ""
     },
-    "INITIAL_CHAT_IDS": {
-      "description": "CHAT IDS",
-      "required": true
+    "CHAT_IDS": {
+      "description": "Comma-separated Telegram chat/group IDs where SMS will be sent",
+      "required": true,
+      "value": "-1003072064847"
     },
-    "ADMIN_CHAT_IDS": {
-      "description": "Comma separated list of admin IDs",
-      "required": true
+    "MONGO_URI": {
+      "description": "MongoDB Atlas connection URI (for storing processed SMS IDs)",
+      "required": true,
+      "value": "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority"
+    },
+    "FETCH_INTERVAL": {
+      "description": "Seconds between each SMS check",
+      "required": false,
+      "value": "2"
     }
-  }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "Basic"
+    }
+  },
+  "buildpacks": [
+    { "url": "heroku/python" }
+  ]
 }
