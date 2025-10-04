@@ -1,46 +1,51 @@
 {
-  "name": "IVASMS OTP Forwarder",
-  "description": "Fetches OTPs from IVASMS and forwards to Telegram using MongoDB to prevent duplicates. Fully Heroku-ready and runs 24/7.",
-  "repository": "https://github.com/BrandedSupport/IVASMSForwarder",
-  "keywords": ["heroku", "telegram", "otp", "sms", "forwarder", "mongodb"],
+  "name": "ivasms-telegram-bot",
+  "description": "IVASMS OTP forwarder to Telegram using cookies in ENV",
+  "repository": "https://github.com/yourusername/ivasms-telegram-bot",
+  "keywords": ["telegram", "otp", "sms", "ivasms", "bot"],
+  "stack": "heroku-22",
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ],
   "env": {
-    "BOT_TOKEN": {
-      "description": "Your Telegram Bot token",
+    "YOUR_BOT_TOKEN": {
+      "description": "Telegram bot token from @BotFather",
       "required": true
     },
-    "USERNAME": {
-      "description": "IVASMS login username",
-      "required": true,
-      "value": ""
+    "ADMIN_CHAT_IDS": {
+      "description": "Comma separated Telegram user IDs of bot admins",
+      "required": true
     },
-    "PASSWORD": {
-      "description": "IVASMS login password",
-      "required": true,
-      "value": ""
-    },
-    "CHAT_IDS": {
-      "description": "Comma-separated Telegram chat/group IDs where SMS will be sent",
-      "required": true,
-      "value": "-1003072064847"
+    "COOKIES_NT": {
+      "description": "Netscape cookie file content exported from browser (multiline)",
+      "required": true
     },
     "MONGO_URI": {
-      "description": "MongoDB Atlas connection URI (for storing processed SMS IDs)",
-      "required": true,
-      "value": "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority"
+      "description": "MongoDB connection URI (optional, leave empty for JSON fallback)",
+      "required": false
     },
-    "FETCH_INTERVAL": {
-      "description": "Seconds between each SMS check",
-      "required": false,
-      "value": "2"
+    "DB_NAME": {
+      "description": "MongoDB database name",
+      "value": "ivasms_bot"
+    },
+    "COLLECTION_NAME": {
+      "description": "MongoDB collection name",
+      "value": "processed_sms"
+    },
+    "POLLING_INTERVAL_SECONDS": {
+      "description": "Polling interval in seconds",
+      "value": "5"
     }
+  },
+  "scripts": {
+    "postdeploy": "echo 'Bot deployed. Make sure YOUR_BOT_TOKEN and COOKIES_NT are set!'"
   },
   "formation": {
     "worker": {
       "quantity": 1,
       "size": "Basic"
     }
-  },
-  "buildpacks": [
-    { "url": "heroku/python" }
-  ]
+  }
 }
