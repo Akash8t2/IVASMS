@@ -30,7 +30,7 @@ from pymongo.errors import PyMongoError
 # -----------------------------
 # Config (from environment)
 # -----------------------------
-YOUR_BOT_TOKEN = os.getenv("YOUR_BOT_TOKEN")  # Telegram bot token
+YOUR_BOT_TOKEN = os.getenv("BOT_TOKEN")  # Telegram bot token
 ADMIN_CHAT_IDS = [s.strip() for s in os.getenv("ADMIN_CHAT_IDS", "").split(",") if s.strip()]
 INITIAL_CHAT_IDS = ["-1003073839183", "-1002907713631"]
 LOGIN_URL = "https://www.ivasms.com/login"
