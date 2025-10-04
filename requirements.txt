@@ -1,3 +1,4 @@
 python-telegram-bot[job-queue]==20.7
 httpx
 beautifulsoup4
+pymongo
