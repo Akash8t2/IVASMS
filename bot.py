@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IVASMS -> Telegram forwarder
-Single-file, Python-only, dynamic hidden-field login + Mongo dedupe.
-Works on Termux or Heroku (use Procfile: worker: python bot.py)
+IVASMS -> Telegram forwarder (Cloudscraper edition)
+- Uses cloudscraper to bypass Cloudflare/WAF challenges (403 "Just a moment...")
+- Runs on Termux or Heroku
+- Stores processed IDs in MongoDB (with JSON fallback)
+- Telegram admin commands to manage chat IDs
 """
 
 import os
@@ -12,13 +14,12 @@ import json
 import time
 import traceback
 import asyncio
-import httpx
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from datetime import datetime, timedelta
 from hashlib import sha1
+from datetime import datetime, timedelta
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 
-# Telegram libs (python-telegram-bot v20+)
+# Telegram (async)
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -26,14 +27,17 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
+# cloudscraper (blocking). We'll call it inside asyncio.to_thread
+import cloudscraper
+
 # -------------------------
 # Configuration (env vars)
 # -------------------------
-YOUR_BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("BOT_TOKEN")
+YOUR_BOT_TOKEN = os.getenv("YOUR_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 USERNAME = os.getenv("USERNAME")
 PASSWORD = os.getenv("PASSWORD")
 ADMIN_CHAT_IDS = [s.strip() for s in os.getenv("ADMIN_CHAT_IDS", "").split(",") if s.strip()]
-# chat ids storage file (local fallback)
+
 CHAT_IDS_FILE = "chat_ids.json"
 INITIAL_CHAT_IDS = ["-1003073839183", "-1002907713631"]
 
@@ -44,52 +48,37 @@ SMS_API_ENDPOINT = "https://www.ivasms.com/portal/sms/received/getsms"
 POLLING_INTERVAL_SECONDS = int(os.getenv("POLLING_INTERVAL_SECONDS", "2"))
 STATE_FILE = "processed_sms_ids.json"
 
-# MongoDB config (you provided this earlier; keep as default but allow override)
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority")
 DB_NAME = os.getenv("DB_NAME", "ivasms_bot")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "processed_sms")
 
-# -------------------------
-# Service keyword lists (shortened here; extend if needed)
-# You can paste your full SERVICE_KEYWORDS / SERVICE_EMOJIS / COUNTRY_FLAGS if desired.
-# -------------------------
+# Minimal keyword lists (extend/replace with your full ones)
 SERVICE_KEYWORDS = {
-    "Facebook": ["facebook"],
-    "Google": ["google", "gmail"],
-    "WhatsApp": ["whatsapp"],
-    "Telegram": ["telegram"],
-    "Instagram": ["instagram"],
-    "Unknown": ["unknown"]
+    "Facebook": ["facebook"], "Google": ["google", "gmail"], "WhatsApp": ["whatsapp"],
+    "Telegram": ["telegram"], "Instagram": ["instagram"], "Unknown": ["unknown"]
 }
-
-SERVICE_EMOJIS = {
-    "Telegram": "📩", "WhatsApp": "🟢", "Facebook": "📘", "Instagram": "📸", "Unknown": "❓"
-}
-
-COUNTRY_FLAGS = {
-    "India": "🇮🇳", "Unknown Country": "🏴‍☠️"
-}
+SERVICE_EMOJIS = {"Telegram": "📩", "WhatsApp": "🟢", "Facebook": "📘", "Instagram": "📸", "Unknown": "❓"}
+COUNTRY_FLAGS = {"India": "🇮🇳", "Unknown Country": "🏴‍☠️"}
 
 # -------------------------
-# MongoDB initialization
+# MongoDB init
 # -------------------------
 mongo_client = None
 mongo_collection = None
 if MONGO_URI:
     try:
         mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        mongo_client.server_info()  # test connection
+        mongo_client.server_info()
         mongo_collection = mongo_client[DB_NAME][COLLECTION_NAME]
         print("✅ MongoDB connected successfully.")
     except PyMongoError as e:
         print("⚠️ MongoDB connect failed, falling back to JSON. Error:", e)
         mongo_collection = None
 else:
-    print("⚠️ MONGO_URI not set. Using JSON fallback storage.")
     mongo_collection = None
 
 # -------------------------
-# Helper functions
+# Chat ID helpers & processed ids
 # -------------------------
 def load_chat_ids():
     if not os.path.exists(CHAT_IDS_FILE):
@@ -99,9 +88,7 @@ def load_chat_ids():
     try:
         with open(CHAT_IDS_FILE, "r") as f:
             data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return INITIAL_CHAT_IDS.copy()
+            return data if isinstance(data, list) else INITIAL_CHAT_IDS.copy()
     except Exception:
         return INITIAL_CHAT_IDS.copy()
 
@@ -119,7 +106,6 @@ def load_processed_ids():
         except PyMongoError as e:
             print("⚠️ Mongo read error:", e)
             return set()
-    # JSON fallback
     if not os.path.exists(STATE_FILE):
         return set()
     try:
@@ -135,7 +121,6 @@ def save_processed_id(sms_id: str):
             return
         except PyMongoError as e:
             print("⚠️ Mongo write error:", e)
-    # fallback
     try:
         s = load_processed_ids()
         s.add(sms_id)
@@ -154,7 +139,7 @@ def escape_markdown(text):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if str(uid) in ADMIN_CHAT_IDS:
-        await update.message.reply_text("Welcome Admin!\n/ add_chat <id>\n/ remove_chat <id>\n/ list_chats")
+        await update.message.reply_text("Welcome Admin!\nCommands: /add_chat <id>, /remove_chat <id>, /list_chats")
     else:
         await update.message.reply_text("You are not authorized.")
 
@@ -208,87 +193,82 @@ async def list_chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("No chat IDs registered.")
 
 # -------------------------
-# Login and fetch logic
+# Cloudscraper blocking helpers (run in thread)
 # -------------------------
-async def login_and_get_session(client: httpx.AsyncClient):
+def create_scraper_session():
+    # cloudscraper.create_scraper() uses requests.Session underneath and handles Cloudflare JS challenge
+    s = cloudscraper.create_scraper(allow_brotli=True)
+    # set a realistic user-agent
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Referer": LOGIN_URL
+    })
+    return s
+
+def blocking_login_and_fetch(scraper, username, password):
     """
-    Perform GET on login page, collect dynamic hidden inputs,
-    then POST to login.
-    Returns True/False and the final response after login attempt.
+    Uses cloudscraper session to GET login, POST credentials with dynamic hidden fields,
+    and returns (ok_bool, final_html_text)
     """
     try:
-        # GET login page to get cookies & hidden fields
-        resp = await client.get(LOGIN_URL)
+        resp = scraper.get(LOGIN_URL, timeout=30)
         soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Build login payload dynamically (include all hidden inputs)
-        login_data = {}
-        # try common names
-        # leave final assignment of email/password to prefer user's env names
+        payload = {}
         for hidden in soup.find_all("input", {"type": "hidden"}):
             name = hidden.get("name")
             val = hidden.get("value", "")
             if name:
-                login_data[name] = val
-
-        # Common field names mapping: try to set typical ones if present
-        # Many sites use 'email'/'username'/'user' etc.
-        # We'll attempt to set the values on common keys if they exist, else add defaults
-        keys_lower = {k.lower(): k for k in login_data.keys()}
-
-        if "email" in keys_lower:
-            login_data[keys_lower["email"]] = USERNAME
-        elif "username" in keys_lower:
-            login_data[keys_lower["username"]] = USERNAME
-        elif "user" in keys_lower:
-            login_data[keys_lower["user"]] = USERNAME
+                payload[name] = val
+        # set credentials into common keys
+        lowered = {k.lower(): k for k in payload.keys()}
+        if "email" in lowered:
+            payload[lowered["email"]] = username
+        elif "username" in lowered:
+            payload[lowered["username"]] = username
         else:
-            # add common names
-            login_data.setdefault("email", USERNAME)
-            login_data.setdefault("username", USERNAME)
+            payload["email"] = username
 
-        if "password" in keys_lower:
-            login_data[keys_lower["password"]] = PASSWORD
-        elif "pass" in keys_lower:
-            login_data[keys_lower["pass"]] = PASSWORD
+        if "password" in lowered:
+            payload[lowered["password"]] = password
+        elif "pass" in lowered:
+            payload[lowered["pass"]] = password
         else:
-            login_data.setdefault("password", PASSWORD)
+            payload["password"] = password
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Referer": LOGIN_URL
-        }
-
-        login_resp = await client.post(LOGIN_URL, data=login_data, headers=headers)
-        html = login_resp.text.lower()
-
+        post = scraper.post(LOGIN_URL, data=payload, timeout=30, allow_redirects=True)
+        html = post.text.lower()
         # heuristics for success
-        if "dashboard" in html or "logout" in html or login_resp.status_code in (301, 302):
-            return True, login_resp
-        # sometimes the page remains same; check if token changed or an authenticated fragment exists
-        if "login" not in str(login_resp.url).lower() and login_resp.status_code == 200:
-            return True, login_resp
-
-        # fallback: return False and login_resp for debugging
-        return False, login_resp
-
+        if "dashboard" in html or "logout" in html or post.status_code in (301,302):
+            return True, post.text
+        # sometimes cloudscraper solves challenge and returns the dashboard after subsequent get
+        if "just a moment" in html and post.status_code == 200:
+            # challenge page — cloudscraper may auto-wait, but if still here, do another GET
+            follow = scraper.get(BASE_URL, timeout=30)
+            h = follow.text.lower()
+            if "dashboard" in h or "logout" in h:
+                return True, follow.text
+        # fallback false
+        return False, post.text
     except Exception as e:
-        print("❌ Exception during login:", e)
-        traceback.print_exc()
-        return False, None
+        return False, f"exception: {e}"
 
-async def fetch_sms_from_api(client: httpx.AsyncClient, headers: dict, csrf_token: str):
-    all_messages = []
+def blocking_fetch_sms(scraper, csrf_token):
+    """
+    Use cloudscraper (requests-like) to call the SMS endpoints (synchronous).
+    Returns list of message dicts similar to previous async version.
+    """
+    messages = []
     try:
         today = datetime.utcnow()
         start_date = today - timedelta(days=1)
         from_date_str, to_date_str = start_date.strftime('%m/%d/%Y'), today.strftime('%m/%d/%Y')
         first_payload = {'from': from_date_str, 'to': to_date_str, '_token': csrf_token}
-        summary_response = await client.post(SMS_API_ENDPOINT, headers=headers, data=first_payload)
-        summary_response.raise_for_status()
-        summary_soup = BeautifulSoup(summary_response.text, 'html.parser')
+        summary_res = scraper.post(SMS_API_ENDPOINT, data=first_payload, timeout=30)
+        summary_res.raise_for_status()
+        summary_soup = BeautifulSoup(summary_res.text, "html.parser")
         group_divs = summary_soup.find_all('div', {'class': 'pointer'})
-        if not group_divs: return []
+        if not group_divs:
+            return []
 
         group_ids = [re.search(r"getDetials\('(.+?)'\)", div.get('onclick', '')).group(1)
                      for div in group_divs if re.search(r"getDetials\('(.+?)'\)", div.get('onclick', ''))]
@@ -298,8 +278,8 @@ async def fetch_sms_from_api(client: httpx.AsyncClient, headers: dict, csrf_toke
 
         for group_id in group_ids:
             numbers_payload = {'start': from_date_str, 'end': to_date_str, 'range': group_id, '_token': csrf_token}
-            numbers_response = await client.post(numbers_url, headers=headers, data=numbers_payload)
-            numbers_soup = BeautifulSoup(numbers_response.text, 'html.parser')
+            numbers_res = scraper.post(numbers_url, data=numbers_payload, timeout=30)
+            numbers_soup = BeautifulSoup(numbers_res.text, "html.parser")
             number_divs = numbers_soup.select("div[onclick*='getDetialsNumber']")
             if not number_divs:
                 continue
@@ -307,8 +287,8 @@ async def fetch_sms_from_api(client: httpx.AsyncClient, headers: dict, csrf_toke
 
             for phone_number in phone_numbers:
                 sms_payload = {'start': from_date_str, 'end': to_date_str, 'Number': phone_number, 'Range': group_id, '_token': csrf_token}
-                sms_response = await client.post(sms_url, headers=headers, data=sms_payload)
-                sms_soup = BeautifulSoup(sms_response.text, 'html.parser')
+                sms_res = scraper.post(sms_url, data=sms_payload, timeout=30)
+                sms_soup = BeautifulSoup(sms_res.text, "html.parser")
                 final_sms_cards = sms_soup.find_all('div', class_='card-body')
 
                 for card in final_sms_cards:
@@ -316,40 +296,46 @@ async def fetch_sms_from_api(client: httpx.AsyncClient, headers: dict, csrf_toke
                     if sms_text_p:
                         sms_text = sms_text_p.get_text(separator='\n').strip()
                         date_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-
                         country_name_match = re.match(r'([a-zA-Z\s]+)', group_id)
                         country_name = country_name_match.group(1).strip() if country_name_match else group_id.strip()
-
                         service = "Unknown"
                         lower_sms_text = sms_text.lower()
-                        for service_name, keywords in SERVICE_KEYWORDS.items():
-                            if any(keyword in lower_sms_text for keyword in keywords):
-                                service = service_name
+                        for sname, keywords in SERVICE_KEYWORDS.items():
+                            if any(k in lower_sms_text for k in keywords):
+                                service = sname
                                 break
                         code_match = re.search(r'(\d{3}-\d{3})', sms_text) or re.search(r'\b(\d{4,8})\b', sms_text)
                         code = code_match.group(1) if code_match else "N/A"
                         unique_id = sha1(f"{phone_number}|{sms_text}".encode()).hexdigest()
                         flag = COUNTRY_FLAGS.get(country_name, "🏴‍☠️")
-
-                        all_messages.append({
-                            "id": unique_id,
-                            "time": date_str,
-                            "number": phone_number,
-                            "country": country_name,
-                            "flag": flag,
-                            "service": service,
-                            "code": code,
-                            "full_sms": sms_text
+                        messages.append({
+                            "id": unique_id, "time": date_str, "number": phone_number,
+                            "country": country_name, "flag": flag, "service": service,
+                            "code": code, "full_sms": sms_text
                         })
-        return all_messages
-    except httpx.RequestError as e:
-        print("❌ Network issue (httpx):", e)
-        return []
+        return messages
     except Exception as e:
-        print("❌ Error fetching or processing API data:", e)
+        print("❌ Blocking fetch SMS error:", e)
         traceback.print_exc()
         return []
 
+# -------------------------
+# Async wrappers (call blocking functions in thread)
+# -------------------------
+async def login_with_cloudscraper():
+    return await asyncio.to_thread(_login_thread)
+
+def _login_thread():
+    s = create_scraper_session()
+    ok, html_or_text = blocking_login_and_fetch(s, USERNAME, PASSWORD)
+    return (ok, html_or_text, s)  # return session object so it can be reused
+
+async def fetch_sms_with_cloudscraper(session, csrf_token):
+    return await asyncio.to_thread(blocking_fetch_sms, session, csrf_token)
+
+# -------------------------
+# send message (async)
+# -------------------------
 async def send_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id: str, message_data: dict):
     try:
         time_str = message_data.get("time", "N/A")
@@ -359,7 +345,6 @@ async def send_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id: str
         service_name = message_data.get("service", "N/A")
         code_str = message_data.get("code", "N/A")
         full_sms_text = message_data.get("full_sms", "N/A")
-
         service_emoji = SERVICE_EMOJIS.get(service_name, "❓")
         full_message = (
             f"🔔 *You have successfully received OTP*\n\n"
@@ -368,95 +353,76 @@ async def send_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id: str
             f"🏆 *Service:* {service_emoji} {escape_markdown(service_name)}\n"
             f"🌎 *Country:* {escape_markdown(country_name)} {flag_emoji}\n"
             f"⏳ *Time:* `{escape_markdown(time_str)}`\n\n"
-            f"💬 *Message:*\n"
-            f"```\n{full_sms_text}\n```"
+            f"💬 *Message:*\n```\n{full_sms_text}\n```"
         )
         await context.bot.send_message(chat_id=chat_id, text=full_message, parse_mode='MarkdownV2')
     except Exception as e:
         print(f"❌ Error sending message to chat ID {chat_id}: {e}")
 
 # -------------------------
-# Job executed periodically
+# Main periodic job
 # -------------------------
 async def check_sms_job(context: ContextTypes.DEFAULT_TYPE):
     print(f"\n--- [{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Checking for new messages ---")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        try:
-            ok, login_resp = await login_and_get_session(client)
-            if not ok:
-                print("❌ Login failed. Check username/password or site changes.")
-                if login_resp is not None:
-                    print("Response URL:", login_resp.url)
-                    print("Status code:", login_resp.status_code)
-                    snippet = login_resp.text[:800].replace("\n", " ")
-                    print("Response snippet (truncated):", snippet)
-                return
+    try:
+        ok, html_or_text, session = await login_with_cloudscraper()
+        if not ok:
+            print("❌ Login failed (cloudscraper). Response snippet (truncated):")
+            snippet = (html_or_text or "")[:800].replace("\n", " ")
+            print(snippet)
+            return
 
-            # Extract csrf token from dashboard page (common meta or hidden input)
-            soup = BeautifulSoup(login_resp.text, "html.parser")
-            csrf_token = None
-            meta = soup.find("meta", {"name": "csrf-token"})
-            if meta and meta.get("content"):
-                csrf_token = meta.get("content")
-            else:
-                # try hidden inputs
-                hid = soup.find("input", {"name": "_token"}) or soup.find("input", {"name": "csrf_token"})
-                if hid and hid.get("value"):
-                    csrf_token = hid.get("value")
+        # extract csrf token from returned HTML
+        soup = BeautifulSoup(html_or_text, "html.parser")
+        csrf = None
+        meta = soup.find("meta", {"name": "csrf-token"})
+        if meta and meta.get("content"):
+            csrf = meta.get("content")
+        else:
+            hid = soup.find("input", {"name": "_token"}) or soup.find("input", {"name": "csrf_token"})
+            if hid and hid.get("value"):
+                csrf = hid.get("value")
+        if not csrf:
+            csrf = ""  # some endpoints may accept empty value
 
-            if not csrf_token:
-                # fallback: some implementations expect _token in the first payload; try empty string
-                csrf_token = ""
+        messages = await fetch_sms_with_cloudscraper(session, csrf)
+        if not messages:
+            print("✔️ No new messages found.")
+            return
 
-            messages = await fetch_sms_from_api(client, headers, csrf_token)
-            if not messages:
-                print("✔️ No new messages found.")
-                return
-
-            processed_ids = load_processed_ids()
-            chat_ids_to_send = load_chat_ids()
-            new_messages_found = 0
-
-            for msg in reversed(messages):
-                if msg["id"] not in processed_ids:
-                    new_messages_found += 1
-                    print(f"✔️ New message from {msg['number']}. Sending to {len(chat_ids_to_send)} chats.")
-                    for chat_id in chat_ids_to_send:
-                        await send_telegram_message(context, chat_id, msg)
-                    save_processed_id(msg["id"])
-                else:
-                    # optional: print skip
-                    pass
-
-            if new_messages_found > 0:
-                print(f"✅ Sent {new_messages_found} new messages.")
-        except httpx.RequestError as e:
-            print("❌ Network or login issue (httpx):", e)
-        except Exception as e:
-            print("❌ Error in main job:", e)
-            traceback.print_exc()
+        processed_ids = load_processed_ids()
+        chat_ids = load_chat_ids()
+        new_found = 0
+        for msg in reversed(messages):
+            if msg["id"] not in processed_ids:
+                new_found += 1
+                print(f"✔️ New message from {msg['number']}. Sending...")
+                for cid in chat_ids:
+                    await send_telegram_message(context, cid, msg)
+                save_processed_id(msg["id"])
+        if new_found > 0:
+            print(f"✅ Sent {new_found} new messages.")
+    except Exception as e:
+        print("❌ Error in check_sms_job:", e)
+        traceback.print_exc()
 
 # -------------------------
-# Main startup
+# Startup
 # -------------------------
 def main():
     if not YOUR_BOT_TOKEN:
-        print("❌ Set YOUR_BOT_TOKEN env var and restart.")
+        print("❌ Set YOUR_BOT_TOKEN env var.")
         return
     if not USERNAME or not PASSWORD:
-        print("❌ Set USERNAME and PASSWORD env vars and restart.")
+        print("❌ Set USERNAME and PASSWORD env vars.")
         return
 
     application = Application.builder().token(YOUR_BOT_TOKEN).build()
-
-    # add command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("add_chat", add_chat_command))
     application.add_handler(CommandHandler("remove_chat", remove_chat_command))
     application.add_handler(CommandHandler("list_chats", list_chats_command))
 
-    # schedule job
     job_queue = application.job_queue
     job_queue.run_repeating(check_sms_job, interval=POLLING_INTERVAL_SECONDS, first=1)
 
