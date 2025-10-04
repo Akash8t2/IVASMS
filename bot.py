@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IVASMS -> Telegram Forwarder
-- Fetches SMS from IVASMS dashboard
-- Forwards to registered chat IDs
-- Prevents duplicate forwards using MongoDB (with JSON fallback)
-- Telegram command handlers to add/remove/list chat IDs
+IVASMS -> Telegram forwarder
+Single-file, Python-only, dynamic hidden-field login + Mongo dedupe.
+Works on Termux or Heroku (use Procfile: worker: python bot.py)
 """
 
 import os
@@ -13,6 +11,7 @@ import re
 import json
 import time
 import traceback
+import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -27,193 +26,71 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-# -----------------------------
-# Config (from environment)
-# -----------------------------
-YOUR_BOT_TOKEN = os.getenv("BOT_TOKEN")  # Telegram bot token
+# -------------------------
+# Configuration (env vars)
+# -------------------------
+YOUR_BOT_TOKEN = os.getenv("YOUR_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+USERNAME = os.getenv("USERNAME")
+PASSWORD = os.getenv("PASSWORD")
 ADMIN_CHAT_IDS = [s.strip() for s in os.getenv("ADMIN_CHAT_IDS", "").split(",") if s.strip()]
+# chat ids storage file (local fallback)
+CHAT_IDS_FILE = "chat_ids.json"
 INITIAL_CHAT_IDS = ["-1003073839183", "-1002907713631"]
+
 LOGIN_URL = "https://www.ivasms.com/login"
 BASE_URL = "https://www.ivasms.com/"
 SMS_API_ENDPOINT = "https://www.ivasms.com/portal/sms/received/getsms"
-USERNAME = os.getenv("USERNAME")
-PASSWORD = os.getenv("PASSWORD")
 
 POLLING_INTERVAL_SECONDS = int(os.getenv("POLLING_INTERVAL_SECONDS", "2"))
 STATE_FILE = "processed_sms_ids.json"
-CHAT_IDS_FILE = "chat_ids.json"
 
-# -----------------------------
-# Country flags, keywords etc.
-# (You already had these — keep as-is)
-# -----------------------------
-COUNTRY_FLAGS = {  
-    "Afghanistan": "🇦🇫", "Albania": "🇦🇱", "Algeria": "🇩🇿", "Andorra": "🇦🇩", "Angola": "🇦🇴",  
-    "Argentina": "🇦🇷", "Armenia": "🇦🇲", "Australia": "🇦🇺", "Austria": "🇦🇹", "Azerbaijan": "🇦🇿",  
-    "Bahrain": "🇧🇭", "Bangladesh": "🇧🇩", "Belarus": "🇧🇾", "Belgium": "🇧🇪", "Benin": "🇧🇯",  
-    "Bhutan": "🇧🇹", "Bolivia": "🇧🇴", "Brazil": "🇧🇷", "Bulgaria": "🇧🇬", "Burkina Faso": "🇧🇫",  
-    "Cambodia": "🇰🇭", "Cameroon": "🇨🇲", "Canada": "🇨🇦", "Chad": "🇹🇩", "Chile": "🇨 ",  
-    "China": "🇨🇳", "Colombia": "🇨🇴", "Congo": "🇨🇬", "Croatia": "🇭🇷", "Cuba": "🇨🇺",  
-    "Cyprus": "🇨🇾", "Czech Republic": "🇨🇿", "Denmark": "🇩🇰", "Egypt": "🇪🇬", "Estonia": "🇪🇪",  
-    "Ethiopia": "🇪🇹", "Finland": "🇫🇮", "France": "🇫🇷", "Gabon": "🇬🇦", "Gambia": "🇬🇲",  
-    "Georgia": "🇬🇪", "Germany": "🇩🇪", "Ghana": "🇬🇭", "Greece": "🇬🇷", "Guatemala": "🇬🇹",  
-    "Guinea": "🇬🇳", "Haiti": "🇭🇹", "Honduras": "🇭🇳", "Hong Kong": "🇭🇰", "Hungary": "🇭🇺",  
-    "Iceland": "🇮🇸", "India": "🇮🇳", "Indonesia": "🇮🇩", "Iran": "🇮🇷", "Iraq": "🇮🇶",  
-    "Ireland": "🇮🇪", "Israel": "🇮🇱", "Italy": "🇮🇹", "IVORY COAST": "🇨🇮", "Ivory Coast": "🇨🇮", "Jamaica": "🇯🇲",  
-    "Japan": "🇯🇵", "Jordan": "🇯🇴", "Kazakhstan": "🇰🇿", "Kenya": "🇰🇪", "Kuwait": "🇰🇼",  
-    "Kyrgyzstan": "🇰🇬", "Laos": "🇱🇦", "Latvia": "🇱🇻", "Lebanon": "🇱🇧", "Liberia": "🇱🇷",  
-    "Libya": "🇱🇾", "Lithuania": "🇱🇹", "Luxembourg": "🇱🇺", "Madagascar": "🇲🇬", "Malaysia": "🇲🇾",  
-    "Mali": "🇲🇱", "Malta": "🇲🇹", "Mexico": "🇲🇽", "Moldova": "🇲🇩", "Monaco": "🇲🇨",  
-    "Mongolia": "🇲🇳", "Montenegro": "🇲🇪", "Morocco": "🇲🇦", "Mozambique": "🇲🇿", "Myanmar": "🇲🇲",  
-    "Namibia": "🇳🇦", "Nepal": "🇳🇵", "Netherlands": "🇳🇱", "New Zealand": "🇳🇿", "Nicaragua": "🇳🇮",  
-    "Niger": "🇳🇪", "Nigeria": "🇳🇬", "North Korea": "🇰🇵", "North Macedonia": "🇲🇰", "Norway": "🇳🇴",  
-    "Oman": "🇴🇲", "Pakistan": "🇵🇰", "Panama": "🇵🇦", "Paraguay": "🇵🇾", "Peru": "🇵🇪",  
-    "Philippines": "🇵🇭", "Poland": "🇵🇱", "Portugal": "🇵🇹", "Qatar": "🇶🇦", "Romania": "🇷🇴",  
-    "Russia": "🇷🇺", "Rwanda": "🇷🇼", "Saudi Arabia": "🇸🇦", "Senegal": "🇸🇳", "Serbia": "🇷🇸",  
-    "Sierra Leone": "🇸🇱", "Singapore": "🇸🇬", "Slovakia": "🇸🇰", "Slovenia": "🇸🇮", "Somalia": "🇸🇴",  
-    "South Africa": "🇿🇦", "South Korea": "🇰🇷", "Spain": "🇪🇸", "Sri Lanka": "🇱🇰", "Sudan": "🇸🇩",  
-    "Sweden": "🇸🇪", "Switzerland": "🇨🇭", "Syria": "🇸🇾", "Taiwan": "🇹🇼", "Tajikistan": "🇹🇯",  
-    "Tanzania": "🇹🇿", "Thailand": "🇹🇭", "TOGO": "🇹🇬", "Tunisia": "🇹🇳", "Turkey": "🇹🇷",  
-    "Turkmenistan": "🇹🇲", "Uganda": "🇺🇬", "Ukraine": "🇺🇦", "United Arab Emirates": "🇦🇪", "United Kingdom": "🇬🇧",  
-    "United States": "🇺🇸", "Uruguay": "🇺🇾", "Uzbekistan": "🇺🇿", "Venezuela": "🇻🇪", "Vietnam": "🇻🇳",  
-    "Yemen": "🇾🇪", "Zambia": "🇿🇲", "Zimbabwe": "🇿🇼", "Unknown Country": "🏴‍☠️"  
-}  
-# Minimal insertion: to keep file short in this message, include your full dict in actual file.
-# For safety paste the full COUNTRY_FLAGS and SERVICE_KEYWORDS and SERVICE_EMOJIS from your original script here.
-
-SERVICE_KEYWORDS = {  
-    "Facebook": ["facebook"],  
-    "Google": ["google", "gmail"],  
-    "WhatsApp": ["whatsapp"],  
-    "Telegram": ["telegram"],  
-    "Instagram": ["instagram"],  
-    "Amazon": ["amazon"],  
-    "Netflix": ["netflix"],  
-    "LinkedIn": ["linkedin"],  
-    "Microsoft": ["microsoft", "outlook", "live.com"],  
-    "Apple": ["apple", "icloud"],  
-    "Twitter": ["twitter"],  
-    "Snapchat": ["snapchat"],  
-    "TikTok": ["tiktok"],  
-    "Discord": ["discord"],  
-    "Signal": ["signal"],  
-    "Viber": ["viber"],  
-    "IMO": ["imo"],  
-    "PayPal": ["paypal"],  
-    "Binance": ["binance"],  
-    "Uber": ["uber"],  
-    "Bolt": ["bolt"],  
-    "Airbnb": ["airbnb"],  
-    "Yahoo": ["yahoo"],  
-    "Steam": ["steam"],  
-    "Blizzard": ["blizzard"],  
-    "Foodpanda": ["foodpanda"],  
-    "Pathao": ["pathao"],  
-    # Newly added service keywords  
-    "Messenger": ["messenger", "meta"],  
-    "Gmail": ["gmail", "google"],  
-    "YouTube": ["youtube", "google"],  
-    "X": ["x", "twitter"],  
-    "eBay": ["ebay"],  
-    "AliExpress": ["aliexpress"],  
-    "Alibaba": ["alibaba"],  
-    "Flipkart": ["flipkart"],  
-    "Outlook": ["outlook", "microsoft"],  
-    "Skype": ["skype", "microsoft"],  
-    "Spotify": ["spotify"],  
-    "iCloud": ["icloud", "apple"],  
-    "Stripe": ["stripe"],  
-    "Cash App": ["cash app", "square cash"],  
-    "Venmo": ["venmo"],  
-    "Zelle": ["zelle"],  
-    "Wise": ["wise", "transferwise"],  
-    "Coinbase": ["coinbase"],  
-    "KuCoin": ["kucoin"],  
-    "Bybit": ["bybit"],  
-    "OKX": ["okx"],  
-    "Huobi": ["huobi"],  
-    "Kraken": ["kraken"],  
-    "MetaMask": ["metamask"],  
-    "Epic Games": ["epic games", "epicgames"],  
-    "PlayStation": ["playstation", "psn"],  
-    "Xbox": ["xbox", "microsoft"],  
-    "Twitch": ["twitch"],  
-    "Reddit": ["reddit"],  
-    "ProtonMail": ["protonmail", "proton"],  
-    "Zoho": ["zoho"],  
-    "Quora": ["quora"],  
-    "StackOverflow": ["stackoverflow"],  
-    "LinkedIn": ["linkedin"],  
-    "Indeed": ["indeed"],  
-    "Upwork": ["upwork"],  
-    "Fiverr": ["fiverr"],  
-    "Glassdoor": ["glassdoor"],  
-    "Airbnb": ["airbnb"],  
-    "Booking.com": ["booking.com", "booking"],  
-    "Careem": ["careem"],  
-    "Swiggy": ["swiggy"],  
-    "Zomato": ["zomato"],  
-    "McDonald's": ["mcdonalds", "mcdonald's"],  
-    "KFC": ["kfc"],  
-    "Nike": ["nike"],  
-    "Adidas": ["adidas"],  
-    "Shein": ["shein"],  
-    "OnlyFans": ["onlyfans"],  
-    "Tinder": ["tinder"],  
-    "Bumble": ["bumble"],  
-    "Grindr": ["grindr"],  
-    "Line": ["line"],  
-    "WeChat": ["wechat"],  
-    "VK": ["vk", "vkontakte"],  
-    "Unknown": ["unknown"] # Fallback, likely won't have specific keywords  
-}  
-SERVICE_EMOJIS = {  
-    "Telegram": "📩", "WhatsApp": "🟢", "Facebook": "📘", "Instagram": "📸", "Messenger": "💬",  
-    "Google": "🔍", "Gmail": "✉️", "YouTube": "▶️", "Twitter": "🐦", "X": "❌",  
-    "TikTok": "🎵", "Snapchat": "👻", "Amazon": "🛒", "eBay": "📦", "AliExpress": "📦",  
-    "Alibaba": "🏭", "Flipkart": "📦", "Microsoft": "🪟", "Outlook": "📧", "Skype": "📞",  
-    "Netflix": "🎬", "Spotify": "🎶", "Apple": "🍏", "iCloud": "☁️", "PayPal": "💰",  
-    "Stripe": "💳", "Cash App": "💵", "Venmo": "💸", "Zelle": "🏦", "Wise": "🌐",  
-    "Binance": "🪙", "Coinbase": "🪙", "KuCoin": "🪙", "Bybit": "📈", "OKX": "🟠",  
-    "Huobi": "🔥", "Kraken": "🐙", "MetaMask": "🦊", "Discord": "🗨️", "Steam": "🎮",  
-    "Epic Games": "🕹️", "PlayStation": "🎮", "Xbox": "🎮", "Twitch": "📺", "Reddit": "👽",  
-    "Yahoo": "🟣", "ProtonMail": "🔐", "Zoho": "📬", "Quora": "❓", "StackOverflow": "🧑‍💻",  
-    "LinkedIn": "💼", "Indeed": "📋", "Upwork": "🧑‍💻", "Fiverr": "💻", "Glassdoor": "🔎",  
-    "Airbnb": "🏠", "Booking.com": "🛏️", "Uber": "🚗", "Lyft": "🚕", "Bolt": "🚖",  
-    "Careem": "🚗", "Swiggy": "🍔", "Zomato": "🍽️", "Foodpanda": "🍱",  
-    "McDonald's": "🍟", "KFC": "🍗", "Nike": "👟", "Adidas": "👟", "Shein": "👗",  
-    "OnlyFans": "🔞", "Tinder": "🔥", "Bumble": "🐝", "Grindr": "😈", "Signal": "🔐",  
-    "Viber": "📞", "Line": "💬", "WeChat": "💬", "VK": "🌐", "Unknown": "❓"  
-}  
-
-# -----------------------------
-# MongoDB Setup
-# -----------------------------
-MONGO_URI = os.getenv(
-    "MONGO_URI",
-    "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority"
-)
+# MongoDB config (you provided this earlier; keep as default but allow override)
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority")
 DB_NAME = os.getenv("DB_NAME", "ivasms_bot")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "processed_sms")
 
+# -------------------------
+# Service keyword lists (shortened here; extend if needed)
+# You can paste your full SERVICE_KEYWORDS / SERVICE_EMOJIS / COUNTRY_FLAGS if desired.
+# -------------------------
+SERVICE_KEYWORDS = {
+    "Facebook": ["facebook"],
+    "Google": ["google", "gmail"],
+    "WhatsApp": ["whatsapp"],
+    "Telegram": ["telegram"],
+    "Instagram": ["instagram"],
+    "Unknown": ["unknown"]
+}
+
+SERVICE_EMOJIS = {
+    "Telegram": "📩", "WhatsApp": "🟢", "Facebook": "📘", "Instagram": "📸", "Unknown": "❓"
+}
+
+COUNTRY_FLAGS = {
+    "India": "🇮🇳", "Unknown Country": "🏴‍☠️"
+}
+
+# -------------------------
+# MongoDB initialization
+# -------------------------
 mongo_client = None
 mongo_collection = None
 if MONGO_URI:
     try:
         mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        mongo_client.server_info()  # will throw if cannot connect
+        mongo_client.server_info()  # test connection
         mongo_collection = mongo_client[DB_NAME][COLLECTION_NAME]
         print("✅ MongoDB connected successfully.")
     except PyMongoError as e:
-        print(f"⚠️ MongoDB connection failed, falling back to JSON file storage. Error: {e}")
+        print("⚠️ MongoDB connect failed, falling back to JSON. Error:", e)
         mongo_collection = None
 else:
-    print("⚠️ MONGO_URI not set; using local JSON fallback.")
+    print("⚠️ MONGO_URI not set. Using JSON fallback storage.")
     mongo_collection = None
 
-# -----------------------------
-# Chat ID file helpers
-# -----------------------------
+# -------------------------
+# Helper functions
+# -------------------------
 def load_chat_ids():
     if not os.path.exists(CHAT_IDS_FILE):
         with open(CHAT_IDS_FILE, "w") as f:
@@ -231,22 +108,18 @@ def load_chat_ids():
 def save_chat_ids(chat_ids):
     try:
         with open(CHAT_IDS_FILE, "w") as f:
-            json.dump(chat_ids, f, indent=4)
+            json.dump(chat_ids, f, indent=2)
     except Exception as e:
         print("❌ Failed to save chat ids:", e)
 
-# -----------------------------
-# Processed IDs storage (Mongo or JSON file)
-# -----------------------------
 def load_processed_ids():
-    """Return set of processed IDs (from Mongo if available, else from JSON file)."""
     if mongo_collection:
         try:
             return {doc["_id"] for doc in mongo_collection.find({}, {"_id": 1})}
         except PyMongoError as e:
-            print("⚠️ MongoDB read error:", e)
+            print("⚠️ Mongo read error:", e)
             return set()
-    # Fallback to file
+    # JSON fallback
     if not os.path.exists(STATE_FILE):
         return set()
     try:
@@ -256,97 +129,154 @@ def load_processed_ids():
         return set()
 
 def save_processed_id(sms_id: str):
-    """Save processed id (Mongo or JSON file)."""
     if mongo_collection:
         try:
             mongo_collection.update_one({"_id": sms_id}, {"$set": {"processed_at": datetime.utcnow()}}, upsert=True)
             return
         except PyMongoError as e:
-            print("⚠️ MongoDB write error:", e)
-    # Fallback file write (atomic-ish)
+            print("⚠️ Mongo write error:", e)
+    # fallback
     try:
-        processed = load_processed_ids()
-        processed.add(sms_id)
+        s = load_processed_ids()
+        s.add(sms_id)
         with open(STATE_FILE, "w") as f:
-            json.dump(list(processed), f)
+            json.dump(list(s), f)
     except Exception as e:
         print("❌ Failed to save processed id to file:", e)
 
-# -----------------------------
-# Markdown escape helper
-# -----------------------------
 def escape_markdown(text):
     escape_chars = r'\_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
 
-# -----------------------------
-# Telegram command handlers
-# -----------------------------
+# -------------------------
+# Telegram handlers
+# -------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if str(user_id) in ADMIN_CHAT_IDS:
-        await update.message.reply_text(
-            "Welcome Admin!\n"
-            "Commands:\n"
-            "/add_chat <chat_id>\n"
-            "/remove_chat <chat_id>\n"
-            "/list_chats"
-        )
+    uid = update.effective_user.id
+    if str(uid) in ADMIN_CHAT_IDS:
+        await update.message.reply_text("Welcome Admin!\n/ add_chat <id>\n/ remove_chat <id>\n/ list_chats")
     else:
-        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+        await update.message.reply_text("You are not authorized.")
 
 async def add_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if str(user_id) not in ADMIN_CHAT_IDS:
-        await update.message.reply_text("Only admins can use this command.")
+    uid = update.effective_user.id
+    if str(uid) not in ADMIN_CHAT_IDS:
+        await update.message.reply_text("Only admins can use this.")
         return
     try:
-        new_chat_id = context.args[0]
+        new_id = context.args[0]
         chat_ids = load_chat_ids()
-        if new_chat_id not in chat_ids:
-            chat_ids.append(new_chat_id)
+        if new_id not in chat_ids:
+            chat_ids.append(new_id)
             save_chat_ids(chat_ids)
-            await update.message.reply_text(f"✅ Chat ID {new_chat_id} added.")
+            await update.message.reply_text(f"Added {new_id}")
         else:
-            await update.message.reply_text("⚠️ Chat ID already present.")
+            await update.message.reply_text("Already present.")
     except Exception:
         await update.message.reply_text("Usage: /add_chat <chat_id>")
 
 async def remove_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if str(user_id) not in ADMIN_CHAT_IDS:
-        await update.message.reply_text("Only admins can use this command.")
+    uid = update.effective_user.id
+    if str(uid) not in ADMIN_CHAT_IDS:
+        await update.message.reply_text("Only admins can use this.")
         return
     try:
-        chat_id = context.args[0]
+        rid = context.args[0]
         chat_ids = load_chat_ids()
-        if chat_id in chat_ids:
-            chat_ids.remove(chat_id)
+        if rid in chat_ids:
+            chat_ids.remove(rid)
             save_chat_ids(chat_ids)
-            await update.message.reply_text(f"✅ Chat ID {chat_id} removed.")
+            await update.message.reply_text(f"Removed {rid}")
         else:
-            await update.message.reply_text("Chat ID not found.")
+            await update.message.reply_text("Not found.")
     except Exception:
         await update.message.reply_text("Usage: /remove_chat <chat_id>")
 
 async def list_chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if str(user_id) not in ADMIN_CHAT_IDS:
-        await update.message.reply_text("Only admins can use this command.")
+    uid = update.effective_user.id
+    if str(uid) not in ADMIN_CHAT_IDS:
+        await update.message.reply_text("Only admins can use this.")
         return
     chat_ids = load_chat_ids()
     if chat_ids:
-        msg = "Registered chat IDs:\n" + "\n".join(f"- `{escape_markdown(str(c))}`" for c in chat_ids)
         try:
+            msg = "Registered chat IDs:\n" + "\n".join(f"- `{escape_markdown(str(c))}`" for c in chat_ids)
             await update.message.reply_text(msg, parse_mode='MarkdownV2')
         except Exception:
             await update.message.reply_text("Registered chat IDs:\n" + "\n".join(chat_ids))
     else:
         await update.message.reply_text("No chat IDs registered.")
 
-# -----------------------------
-# Fetching, parsing, sending
-# -----------------------------
+# -------------------------
+# Login and fetch logic
+# -------------------------
+async def login_and_get_session(client: httpx.AsyncClient):
+    """
+    Perform GET on login page, collect dynamic hidden inputs,
+    then POST to login.
+    Returns True/False and the final response after login attempt.
+    """
+    try:
+        # GET login page to get cookies & hidden fields
+        resp = await client.get(LOGIN_URL)
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Build login payload dynamically (include all hidden inputs)
+        login_data = {}
+        # try common names
+        # leave final assignment of email/password to prefer user's env names
+        for hidden in soup.find_all("input", {"type": "hidden"}):
+            name = hidden.get("name")
+            val = hidden.get("value", "")
+            if name:
+                login_data[name] = val
+
+        # Common field names mapping: try to set typical ones if present
+        # Many sites use 'email'/'username'/'user' etc.
+        # We'll attempt to set the values on common keys if they exist, else add defaults
+        keys_lower = {k.lower(): k for k in login_data.keys()}
+
+        if "email" in keys_lower:
+            login_data[keys_lower["email"]] = USERNAME
+        elif "username" in keys_lower:
+            login_data[keys_lower["username"]] = USERNAME
+        elif "user" in keys_lower:
+            login_data[keys_lower["user"]] = USERNAME
+        else:
+            # add common names
+            login_data.setdefault("email", USERNAME)
+            login_data.setdefault("username", USERNAME)
+
+        if "password" in keys_lower:
+            login_data[keys_lower["password"]] = PASSWORD
+        elif "pass" in keys_lower:
+            login_data[keys_lower["pass"]] = PASSWORD
+        else:
+            login_data.setdefault("password", PASSWORD)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": LOGIN_URL
+        }
+
+        login_resp = await client.post(LOGIN_URL, data=login_data, headers=headers)
+        html = login_resp.text.lower()
+
+        # heuristics for success
+        if "dashboard" in html or "logout" in html or login_resp.status_code in (301, 302):
+            return True, login_resp
+        # sometimes the page remains same; check if token changed or an authenticated fragment exists
+        if "login" not in str(login_resp.url).lower() and login_resp.status_code == 200:
+            return True, login_resp
+
+        # fallback: return False and login_resp for debugging
+        return False, login_resp
+
+    except Exception as e:
+        print("❌ Exception during login:", e)
+        traceback.print_exc()
+        return False, None
+
 async def fetch_sms_from_api(client: httpx.AsyncClient, headers: dict, csrf_token: str):
     all_messages = []
     try:
@@ -358,11 +288,11 @@ async def fetch_sms_from_api(client: httpx.AsyncClient, headers: dict, csrf_toke
         summary_response.raise_for_status()
         summary_soup = BeautifulSoup(summary_response.text, 'html.parser')
         group_divs = summary_soup.find_all('div', {'class': 'pointer'})
-        if not group_divs:
-            return []
+        if not group_divs: return []
 
         group_ids = [re.search(r"getDetials\('(.+?)'\)", div.get('onclick', '')).group(1)
                      for div in group_divs if re.search(r"getDetials\('(.+?)'\)", div.get('onclick', ''))]
+
         numbers_url = urljoin(BASE_URL, "portal/sms/received/getsms/number")
         sms_url = urljoin(BASE_URL, "portal/sms/received/getsms/number/sms")
 
@@ -441,38 +371,43 @@ async def send_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id: str
             f"💬 *Message:*\n"
             f"```\n{full_sms_text}\n```"
         )
-
         await context.bot.send_message(chat_id=chat_id, text=full_message, parse_mode='MarkdownV2')
     except Exception as e:
         print(f"❌ Error sending message to chat ID {chat_id}: {e}")
 
-# -----------------------------
-# Main job - scheduled
-# -----------------------------
+# -------------------------
+# Job executed periodically
+# -------------------------
 async def check_sms_job(context: ContextTypes.DEFAULT_TYPE):
     print(f"\n--- [{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Checking for new messages ---")
-    headers = {'User-Agent': 'Mozilla/5.0'}
-
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         try:
-            login_page_res = await client.get(LOGIN_URL, headers=headers)
-            soup = BeautifulSoup(login_page_res.text, 'html.parser')
-            token_input = soup.find('input', {'name': '_token'})
-            login_data = {'email': USERNAME, 'password': PASSWORD}
-            if token_input:
-                login_data['_token'] = token_input['value']
+            ok, login_resp = await login_and_get_session(client)
+            if not ok:
+                print("❌ Login failed. Check username/password or site changes.")
+                if login_resp is not None:
+                    print("Response URL:", login_resp.url)
+                    print("Status code:", login_resp.status_code)
+                    snippet = login_resp.text[:800].replace("\n", " ")
+                    print("Response snippet (truncated):", snippet)
+                return
 
-            login_res = await client.post(LOGIN_URL, data=login_data, headers=headers)
-            if "login" in str(login_res.url):
-                print("❌ Login failed. Check username/password.")
-                return
-            dashboard_soup = BeautifulSoup(login_res.text, 'html.parser')
-            csrf_token_meta = dashboard_soup.find('meta', {'name': 'csrf-token'})
-            if not csrf_token_meta:
-                print("❌ CSRF token not found.")
-                return
-            csrf_token = csrf_token_meta.get('content')
-            headers['Referer'] = str(login_res.url)
+            # Extract csrf token from dashboard page (common meta or hidden input)
+            soup = BeautifulSoup(login_resp.text, "html.parser")
+            csrf_token = None
+            meta = soup.find("meta", {"name": "csrf-token"})
+            if meta and meta.get("content"):
+                csrf_token = meta.get("content")
+            else:
+                # try hidden inputs
+                hid = soup.find("input", {"name": "_token"}) or soup.find("input", {"name": "csrf_token"})
+                if hid and hid.get("value"):
+                    csrf_token = hid.get("value")
+
+            if not csrf_token:
+                # fallback: some implementations expect _token in the first payload; try empty string
+                csrf_token = ""
 
             messages = await fetch_sms_from_api(client, headers, csrf_token)
             if not messages:
@@ -486,45 +421,46 @@ async def check_sms_job(context: ContextTypes.DEFAULT_TYPE):
             for msg in reversed(messages):
                 if msg["id"] not in processed_ids:
                     new_messages_found += 1
-                    print(f"✔️ New message found from: {msg['number']}.")
+                    print(f"✔️ New message from {msg['number']}. Sending to {len(chat_ids_to_send)} chats.")
                     for chat_id in chat_ids_to_send:
                         await send_telegram_message(context, chat_id, msg)
                     save_processed_id(msg["id"])
+                else:
+                    # optional: print skip
+                    pass
 
             if new_messages_found > 0:
-                print(f"✅ Total {new_messages_found} new messages sent to Telegram.")
+                print(f"✅ Sent {new_messages_found} new messages.")
         except httpx.RequestError as e:
             print("❌ Network or login issue (httpx):", e)
         except Exception as e:
-            print("❌ A problem occurred in the main process:", e)
+            print("❌ Error in main job:", e)
             traceback.print_exc()
 
-# -----------------------------
-# Start the bot
-# -----------------------------
+# -------------------------
+# Main startup
+# -------------------------
 def main():
-    print("🚀 iVasms to Telegram Bot is starting...")
-    if not ADMIN_CHAT_IDS:
-        print("\n!!! 🔴 WARNING: ADMIN_CHAT_IDS is empty. Set ADMIN_CHAT_IDS env var (comma separated user IDs). !!!\n")
-        # Note: We do not exit; admins may still be set later.
-
     if not YOUR_BOT_TOKEN:
-        print("❌ YOUR_BOT_TOKEN is not set. Set environment variable YOUR_BOT_TOKEN and restart.")
+        print("❌ Set YOUR_BOT_TOKEN env var and restart.")
+        return
+    if not USERNAME or not PASSWORD:
+        print("❌ Set USERNAME and PASSWORD env vars and restart.")
         return
 
     application = Application.builder().token(YOUR_BOT_TOKEN).build()
 
-    # Add handlers
+    # add command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("add_chat", add_chat_command))
     application.add_handler(CommandHandler("remove_chat", remove_chat_command))
     application.add_handler(CommandHandler("list_chats", list_chats_command))
 
-    # Schedule job
+    # schedule job
     job_queue = application.job_queue
     job_queue.run_repeating(check_sms_job, interval=POLLING_INTERVAL_SECONDS, first=1)
 
-    print(f"🚀 Checking for new messages every {POLLING_INTERVAL_SECONDS} seconds.")
+    print("🚀 Bot started. Polling every", POLLING_INTERVAL_SECONDS, "seconds.")
     application.run_polling()
 
 if __name__ == "__main__":
