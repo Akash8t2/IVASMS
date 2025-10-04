@@ -29,7 +29,7 @@ from pymongo.errors import PyMongoError
 # -------------------------
 # Configuration (env vars)
 # -------------------------
-YOUR_BOT_TOKEN = os.getenv("YOUR_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+YOUR_BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("BOT_TOKEN")
 USERNAME = os.getenv("USERNAME")
 PASSWORD = os.getenv("PASSWORD")
 ADMIN_CHAT_IDS = [s.strip() for s in os.getenv("ADMIN_CHAT_IDS", "").split(",") if s.strip()]
