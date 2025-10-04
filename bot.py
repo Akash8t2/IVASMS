@@ -1,68 +1,68 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IVASMS -> Telegram forwarder (Cloudscraper edition)
-- Uses cloudscraper to bypass Cloudflare/WAF challenges (403 "Just a moment...")
-- Runs on Termux or Heroku
-- Stores processed IDs in MongoDB (with JSON fallback)
-- Telegram admin commands to manage chat IDs
+IVASMS -> Telegram forwarder using cookies provided via ENV (preferred) or cookies.txt fallback.
+Supports:
+ - COOKIES_NT   : Netscape cookies.txt content (multiline string)
+ - COOKIES_JSON : Playwright storage_state JSON (string) OR JSON array of cookies
+If both are empty, falls back to loading cookies.txt file if present.
 """
-
 import os
 import re
 import json
 import time
 import traceback
-import asyncio
+from io import BytesIO
 from hashlib import sha1
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
-from bs4 import BeautifulSoup
 
-# Telegram (async)
+from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# MongoDB
+import cloudscraper
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-# cloudscraper (blocking). We'll call it inside asyncio.to_thread
-import cloudscraper
-
-# -------------------------
-# Configuration (env vars)
-# -------------------------
-YOUR_BOT_TOKEN = os.getenv("YOUR_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-USERNAME = os.getenv("USERNAME")
-PASSWORD = os.getenv("PASSWORD")
+# ----------------------------
+# Configuration (ENV)
+# ----------------------------
+YOUR_BOT_TOKEN = os.getenv("YOUR_BOT_TOKEN")  # Telegram bot token
+CHAT_IDS_FILE = os.getenv("CHAT_IDS_FILE", "chat_ids.json")
+INITIAL_CHAT_IDS = ["-1003073839183", "-1002907713631"]
 ADMIN_CHAT_IDS = [s.strip() for s in os.getenv("ADMIN_CHAT_IDS", "").split(",") if s.strip()]
 
-CHAT_IDS_FILE = "chat_ids.json"
-INITIAL_CHAT_IDS = ["-1003073839183", "-1002907713631"]
+# Cookie input options (choose one)
+COOKIES_NT = os.getenv("COOKIES_NT", "").strip()       # Netscape cookies.txt content (multiline)
+COOKIES_JSON = os.getenv("COOKIES_JSON", "").strip()   # Playwright storage_state JSON or cookies array
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")  # fallback file path if env not provided
 
+# IVASMS endpoints
+LOGIN_CHECK_URL = "https://www.ivasms.com/"
 LOGIN_URL = "https://www.ivasms.com/login"
 BASE_URL = "https://www.ivasms.com/"
 SMS_API_ENDPOINT = "https://www.ivasms.com/portal/sms/received/getsms"
 
-POLLING_INTERVAL_SECONDS = int(os.getenv("POLLING_INTERVAL_SECONDS", "2"))
-STATE_FILE = "processed_sms_ids.json"
+# Polling interval
+POLLING_INTERVAL_SECONDS = int(os.getenv("POLLING_INTERVAL_SECONDS", "5"))
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority")
+# Processed IDs store
+STATE_FILE = os.getenv("STATE_FILE", "processed_sms_ids.json")
+
+# MongoDB (optional)
+MONGO_URI = os.getenv("MONGO_URI", "")
 DB_NAME = os.getenv("DB_NAME", "ivasms_bot")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "processed_sms")
 
-# Minimal keyword lists (extend/replace with your full ones)
-SERVICE_KEYWORDS = {
-    "Facebook": ["facebook"], "Google": ["google", "gmail"], "WhatsApp": ["whatsapp"],
-    "Telegram": ["telegram"], "Instagram": ["instagram"], "Unknown": ["unknown"]
-}
-SERVICE_EMOJIS = {"Telegram": "📩", "WhatsApp": "🟢", "Facebook": "📘", "Instagram": "📸", "Unknown": "❓"}
-COUNTRY_FLAGS = {"India": "🇮🇳", "Unknown Country": "🏴‍☠️"}
+# Minimal keyword lists (extend if you want)
+SERVICE_KEYWORDS = {"Facebook":["facebook"], "Google":["google","gmail"], "WhatsApp":["whatsapp"], "Telegram":["telegram"], "Instagram":["instagram"], "Unknown":["unknown"]}
+SERVICE_EMOJIS = {"Telegram":"📩","WhatsApp":"🟢","Facebook":"📘","Instagram":"📸","Unknown":"❓"}
+COUNTRY_FLAGS = {"India":"🇮🇳","Unknown Country":"🏴‍☠️"}
 
-# -------------------------
+# ----------------------------
 # MongoDB init
-# -------------------------
+# ----------------------------
 mongo_client = None
 mongo_collection = None
 if MONGO_URI:
@@ -72,14 +72,126 @@ if MONGO_URI:
         mongo_collection = mongo_client[DB_NAME][COLLECTION_NAME]
         print("✅ MongoDB connected successfully.")
     except PyMongoError as e:
-        print("⚠️ MongoDB connect failed, falling back to JSON. Error:", e)
+        print("⚠️ MongoDB connect failed; falling back to JSON. Error:", e)
         mongo_collection = None
 else:
+    print("⚠️ MONGO_URI not provided — using JSON fallback for processed IDs.")
     mongo_collection = None
 
-# -------------------------
-# Chat ID helpers & processed ids
-# -------------------------
+# ----------------------------
+# Cookie loaders (env or file)
+# ----------------------------
+def parse_netscape_from_string(s: str):
+    """Parse a netscape-format cookies string and return dict {name: value}"""
+    cook = {}
+    for line in s.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            name = parts[5].strip()
+            value = parts[6].strip()
+            if name:
+                cook[name] = value
+    return cook
+
+def load_netscape_from_file(path: str):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = f.read()
+        return parse_netscape_from_string(data)
+    except Exception as e:
+        print("❌ Failed to read cookies file:", e)
+        return {}
+
+def parse_cookies_from_playwright_json(s: str):
+    """
+    Accept either:
+      - full storage_state JSON (object with "cookies" key)
+      - or a JSON array of cookie objects
+    Returns dict {name: value}
+    """
+    try:
+        data = json.loads(s)
+        if isinstance(data, dict) and "cookies" in data and isinstance(data["cookies"], list):
+            arr = data["cookies"]
+        elif isinstance(data, list):
+            arr = data
+        else:
+            return {}
+        cookie_dict = {}
+        for c in arr:
+            if isinstance(c, dict) and "name" in c and "value" in c:
+                cookie_dict[c["name"]] = c["value"]
+        return cookie_dict
+    except Exception as e:
+        print("❌ Failed to parse COOKIES_JSON:", e)
+        return {}
+
+def load_cookies_from_env_or_file():
+    # Priority: COOKIES_NT (netscape multiline) -> COOKIES_JSON -> cookies file fallback
+    if COOKIES_NT:
+        d = parse_netscape_from_string(COOKIES_NT)
+        if d:
+            print(f"✅ Loaded {len(d)} cookies from COOKIES_NT env var.")
+            return d
+    if COOKIES_JSON:
+        d = parse_cookies_from_playwright_json(COOKIES_JSON)
+        if d:
+            print(f"✅ Loaded {len(d)} cookies from COOKIES_JSON env var.")
+            return d
+    # fallback to file
+    d = load_netscape_from_file(COOKIES_FILE)
+    if d:
+        print(f"✅ Loaded {len(d)} cookies from file {COOKIES_FILE}.")
+        return d
+    print("⚠️ No cookies found in COOKIES_NT / COOKIES_JSON / cookies.txt")
+    return {}
+
+# ----------------------------
+# Safe decompression
+# ----------------------------
+def safe_decompress(resp):
+    try:
+        enc = (resp.headers.get("Content-Encoding") or "").lower()
+        if "br" in enc:
+            try:
+                import brotli
+                return brotli.decompress(resp.content).decode(errors="replace")
+            except Exception:
+                pass
+        if "gzip" in enc or "deflate" in enc:
+            try:
+                import gzip
+                with BytesIO(resp.content) as bio:
+                    return gzip.GzipFile(fileobj=bio).read().decode(errors="replace")
+            except Exception:
+                pass
+        return resp.text
+    except Exception:
+        return getattr(resp, "text", "")
+
+# ----------------------------
+# Create cloudscraper session and inject cookies
+# ----------------------------
+def create_scraper_with_env_cookies():
+    s = cloudscraper.create_scraper(allow_brotli=True)
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": LOGIN_URL
+    })
+    cookie_dict = load_cookies_from_env_or_file()
+    if cookie_dict:
+        s.cookies.update(cookie_dict)
+    return s
+
+# ----------------------------
+# Chat IDs persistence & processed ids (same as before)
+# ----------------------------
 def load_chat_ids():
     if not os.path.exists(CHAT_IDS_FILE):
         with open(CHAT_IDS_FILE, "w") as f:
@@ -129,13 +241,36 @@ def save_processed_id(sms_id: str):
     except Exception as e:
         print("❌ Failed to save processed id to file:", e)
 
-def escape_markdown(text):
-    escape_chars = r'\_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', str(text))
+# ----------------------------
+# Telegram helpers & handlers
+# ----------------------------
+def escape_markdown(text: str) -> str:
+    esc = r'\_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(esc)}])', r'\\\1', str(text))
 
-# -------------------------
-# Telegram handlers
-# -------------------------
+async def send_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id: str, message_data: dict):
+    try:
+        time_str = message_data.get("time", "N/A")
+        number_str = message_data.get("number", "N/A")
+        country_name = message_data.get("country", "N/A")
+        flag_emoji = message_data.get("flag", "🏴‍☠️")
+        service_name = message_data.get("service", "N/A")
+        code_str = message_data.get("code", "N/A")
+        full_sms_text = message_data.get("full_sms", "N/A")
+        service_emoji = SERVICE_EMOJIS.get(service_name, "❓")
+        full_message = (
+            f"🔔 *You have successfully received OTP*\n\n"
+            f"📞 *Number:* `{escape_markdown(number_str)}`\n"
+            f"🔑 *Code:* `{escape_markdown(code_str)}`\n"
+            f"🏆 *Service:* {service_emoji} {escape_markdown(service_name)}\n"
+            f"🌎 *Country:* {escape_markdown(country_name)} {flag_emoji}\n"
+            f"⏳ *Time:* `{escape_markdown(time_str)}`\n\n"
+            f"💬 *Message:*\n```\n{full_sms_text}\n```"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=full_message, parse_mode='MarkdownV2')
+    except Exception as e:
+        print("❌ Telegram send error:", e)
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if str(uid) in ADMIN_CHAT_IDS:
@@ -192,86 +327,40 @@ async def list_chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("No chat IDs registered.")
 
-# -------------------------
-# Cloudscraper blocking helpers (run in thread)
-# -------------------------
-def create_scraper_session():
-    # cloudscraper.create_scraper() uses requests.Session underneath and handles Cloudflare JS challenge
-    s = cloudscraper.create_scraper(allow_brotli=True)
-    # set a realistic user-agent
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "Referer": LOGIN_URL
-    })
-    return s
-
-def blocking_login_and_fetch(scraper, username, password):
-    """
-    Uses cloudscraper session to GET login, POST credentials with dynamic hidden fields,
-    and returns (ok_bool, final_html_text)
-    """
+# ----------------------------
+# Blocking functions (scraper + SMS fetch)
+# ----------------------------
+def blocking_check_cookies_and_get_html(scraper):
     try:
-        resp = scraper.get(LOGIN_URL, timeout=30)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        payload = {}
-        for hidden in soup.find_all("input", {"type": "hidden"}):
-            name = hidden.get("name")
-            val = hidden.get("value", "")
-            if name:
-                payload[name] = val
-        # set credentials into common keys
-        lowered = {k.lower(): k for k in payload.keys()}
-        if "email" in lowered:
-            payload[lowered["email"]] = username
-        elif "username" in lowered:
-            payload[lowered["username"]] = username
-        else:
-            payload["email"] = username
-
-        if "password" in lowered:
-            payload[lowered["password"]] = password
-        elif "pass" in lowered:
-            payload[lowered["pass"]] = password
-        else:
-            payload["password"] = password
-
-        post = scraper.post(LOGIN_URL, data=payload, timeout=30, allow_redirects=True)
-        html = post.text.lower()
-        # heuristics for success
-        if "dashboard" in html or "logout" in html or post.status_code in (301,302):
-            return True, post.text
-        # sometimes cloudscraper solves challenge and returns the dashboard after subsequent get
-        if "just a moment" in html and post.status_code == 200:
-            # challenge page — cloudscraper may auto-wait, but if still here, do another GET
-            follow = scraper.get(BASE_URL, timeout=30)
-            h = follow.text.lower()
-            if "dashboard" in h or "logout" in h:
-                return True, follow.text
-        # fallback false
-        return False, post.text
+        r = scraper.get(LOGIN_CHECK_URL, timeout=30, allow_redirects=True)
+        text = safe_decompress(r)
+        low = (text or "").lower()
+        if any(k in low for k in ("dashboard","logout","/logout")):
+            return True, text, scraper
+        return False, text, scraper
     except Exception as e:
-        return False, f"exception: {e}"
+        return False, f"exception: {e}", None
 
 def blocking_fetch_sms(scraper, csrf_token):
-    """
-    Use cloudscraper (requests-like) to call the SMS endpoints (synchronous).
-    Returns list of message dicts similar to previous async version.
-    """
-    messages = []
     try:
+        messages = []
         today = datetime.utcnow()
         start_date = today - timedelta(days=1)
         from_date_str, to_date_str = start_date.strftime('%m/%d/%Y'), today.strftime('%m/%d/%Y')
         first_payload = {'from': from_date_str, 'to': to_date_str, '_token': csrf_token}
         summary_res = scraper.post(SMS_API_ENDPOINT, data=first_payload, timeout=30)
-        summary_res.raise_for_status()
-        summary_soup = BeautifulSoup(summary_res.text, "html.parser")
-        group_divs = summary_soup.find_all('div', {'class': 'pointer'})
+        summary_html = safe_decompress(summary_res) or ""
+        soup = BeautifulSoup(summary_html, "html.parser")
+        group_divs = soup.find_all('div', {'class': 'pointer'})
         if not group_divs:
             return []
 
-        group_ids = [re.search(r"getDetials\('(.+?)'\)", div.get('onclick', '')).group(1)
-                     for div in group_divs if re.search(r"getDetials\('(.+?)'\)", div.get('onclick', ''))]
+        group_ids = []
+        for div in group_divs:
+            onclick = div.get('onclick','')
+            m = re.search(r"getDetials\('(.+?)'\)", onclick)
+            if m:
+                group_ids.append(m.group(1))
 
         numbers_url = urljoin(BASE_URL, "portal/sms/received/getsms/number")
         sms_url = urljoin(BASE_URL, "portal/sms/received/getsms/number/sms")
@@ -279,8 +368,9 @@ def blocking_fetch_sms(scraper, csrf_token):
         for group_id in group_ids:
             numbers_payload = {'start': from_date_str, 'end': to_date_str, 'range': group_id, '_token': csrf_token}
             numbers_res = scraper.post(numbers_url, data=numbers_payload, timeout=30)
-            numbers_soup = BeautifulSoup(numbers_res.text, "html.parser")
-            number_divs = numbers_soup.select("div[onclick*='getDetialsNumber']")
+            numbers_html = safe_decompress(numbers_res) or ""
+            nsoup = BeautifulSoup(numbers_html, "html.parser")
+            number_divs = nsoup.select("div[onclick*='getDetialsNumber']")
             if not number_divs:
                 continue
             phone_numbers = [div.text.strip() for div in number_divs]
@@ -288,9 +378,9 @@ def blocking_fetch_sms(scraper, csrf_token):
             for phone_number in phone_numbers:
                 sms_payload = {'start': from_date_str, 'end': to_date_str, 'Number': phone_number, 'Range': group_id, '_token': csrf_token}
                 sms_res = scraper.post(sms_url, data=sms_payload, timeout=30)
-                sms_soup = BeautifulSoup(sms_res.text, "html.parser")
-                final_sms_cards = sms_soup.find_all('div', class_='card-body')
-
+                sms_html = safe_decompress(sms_res) or ""
+                ssoup = BeautifulSoup(sms_html, "html.parser")
+                final_sms_cards = ssoup.find_all('div', class_='card-body')
                 for card in final_sms_cards:
                     sms_text_p = card.find('p', class_='mb-0')
                     if sms_text_p:
@@ -315,77 +405,44 @@ def blocking_fetch_sms(scraper, csrf_token):
                         })
         return messages
     except Exception as e:
-        print("❌ Blocking fetch SMS error:", e)
+        print("❌ blocking_fetch_sms error:", e)
         traceback.print_exc()
         return []
 
-# -------------------------
-# Async wrappers (call blocking functions in thread)
-# -------------------------
-async def login_with_cloudscraper():
-    return await asyncio.to_thread(_login_thread)
+# ----------------------------
+# Async wrappers and job
+# ----------------------------
+async def check_cookies_threaded(scraper):
+    return await asyncio.to_thread(blocking_check_cookies_and_get_html, scraper)
 
-def _login_thread():
-    s = create_scraper_session()
-    ok, html_or_text = blocking_login_and_fetch(s, USERNAME, PASSWORD)
-    return (ok, html_or_text, s)  # return session object so it can be reused
+async def fetch_sms_threaded(scraper, csrf_token):
+    return await asyncio.to_thread(blocking_fetch_sms, scraper, csrf_token)
 
-async def fetch_sms_with_cloudscraper(session, csrf_token):
-    return await asyncio.to_thread(blocking_fetch_sms, session, csrf_token)
-
-# -------------------------
-# send message (async)
-# -------------------------
-async def send_telegram_message(context: ContextTypes.DEFAULT_TYPE, chat_id: str, message_data: dict):
-    try:
-        time_str = message_data.get("time", "N/A")
-        number_str = message_data.get("number", "N/A")
-        country_name = message_data.get("country", "N/A")
-        flag_emoji = message_data.get("flag", "🏴‍☠️")
-        service_name = message_data.get("service", "N/A")
-        code_str = message_data.get("code", "N/A")
-        full_sms_text = message_data.get("full_sms", "N/A")
-        service_emoji = SERVICE_EMOJIS.get(service_name, "❓")
-        full_message = (
-            f"🔔 *You have successfully received OTP*\n\n"
-            f"📞 *Number:* `{escape_markdown(number_str)}`\n"
-            f"🔑 *Code:* `{escape_markdown(code_str)}`\n"
-            f"🏆 *Service:* {service_emoji} {escape_markdown(service_name)}\n"
-            f"🌎 *Country:* {escape_markdown(country_name)} {flag_emoji}\n"
-            f"⏳ *Time:* `{escape_markdown(time_str)}`\n\n"
-            f"💬 *Message:*\n```\n{full_sms_text}\n```"
-        )
-        await context.bot.send_message(chat_id=chat_id, text=full_message, parse_mode='MarkdownV2')
-    except Exception as e:
-        print(f"❌ Error sending message to chat ID {chat_id}: {e}")
-
-# -------------------------
-# Main periodic job
-# -------------------------
 async def check_sms_job(context: ContextTypes.DEFAULT_TYPE):
     print(f"\n--- [{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Checking for new messages ---")
     try:
-        ok, html_or_text, session = await login_with_cloudscraper()
+        scraper = create_scraper_with_env_cookies()
+        ok, html_text, session = await asyncio.to_thread(blocking_check_cookies_and_get_html, scraper)
         if not ok:
-            print("❌ Login failed (cloudscraper). Response snippet (truncated):")
-            snippet = (html_or_text or "")[:800].replace("\n", " ")
-            print(snippet)
+            print("❌ Cookies not authenticated or server returned challenge.")
+            snippet = (html_text or "")[:1200].replace("\n", " ")
+            print("Response snippet (truncated):", snippet)
             return
 
-        # extract csrf token from returned HTML
-        soup = BeautifulSoup(html_or_text, "html.parser")
+        # extract CSRF token if present
+        soup = BeautifulSoup(html_text or "", "html.parser")
         csrf = None
-        meta = soup.find("meta", {"name": "csrf-token"})
+        meta = soup.find("meta", {"name":"csrf-token"})
         if meta and meta.get("content"):
             csrf = meta.get("content")
         else:
-            hid = soup.find("input", {"name": "_token"}) or soup.find("input", {"name": "csrf_token"})
+            hid = soup.find("input", {"name":"_token"}) or soup.find("input", {"name":"csrf_token"})
             if hid and hid.get("value"):
                 csrf = hid.get("value")
         if not csrf:
-            csrf = ""  # some endpoints may accept empty value
+            csrf = ""
 
-        messages = await fetch_sms_with_cloudscraper(session, csrf)
+        messages = await fetch_sms_threaded(session, csrf)
         if not messages:
             print("✔️ No new messages found.")
             return
@@ -406,15 +463,12 @@ async def check_sms_job(context: ContextTypes.DEFAULT_TYPE):
         print("❌ Error in check_sms_job:", e)
         traceback.print_exc()
 
-# -------------------------
-# Startup
-# -------------------------
+# ----------------------------
+# Start / main
+# ----------------------------
 def main():
     if not YOUR_BOT_TOKEN:
-        print("❌ Set YOUR_BOT_TOKEN env var.")
-        return
-    if not USERNAME or not PASSWORD:
-        print("❌ Set USERNAME and PASSWORD env vars.")
+        print("❌ Set YOUR_BOT_TOKEN env var and restart.")
         return
 
     application = Application.builder().token(YOUR_BOT_TOKEN).build()
